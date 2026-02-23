@@ -3,11 +3,13 @@ use crate::err::{
 };
 
 use crate::evtx_record::{EVTX_RECORD_HEADER_SIZE, EvtxRecord, EvtxRecordHeader};
+use crate::utils::ByteCursor;
 use crate::utils::bytes;
 
 use log::{debug, info, trace};
 use std::io::Cursor;
 
+use crate::binxml::compiled_xml;
 use crate::binxml::ir::{IrTemplateCache, build_tree_from_binxml_bytes_direct};
 use crate::string_cache::StringCache;
 use crate::{ParserSettings, checksum_ieee};
@@ -235,6 +237,136 @@ impl<'chunk> EvtxChunk<'chunk> {
             ),
         }
     }
+
+    /// Process all XML records in this chunk using a reusable buffer.
+    ///
+    /// For compiled XML fast path records, renders directly into `xml_buf`
+    /// (which retains capacity across calls). For IR fallback records, renders
+    /// via the normal tree path into the same buffer.
+    ///
+    /// The callback receives `(event_record_id, timestamp, xml_bytes)` for each
+    /// successfully rendered record. Errors are passed to the error callback.
+    pub fn for_each_xml_record<F, E>(
+        &mut self,
+        xml_buf: &mut Vec<u8>,
+        mut on_record: F,
+        mut on_error: E,
+    ) -> crate::err::Result<()>
+    where
+        F: FnMut(u64, jiff::Timestamp, &[u8]),
+        E: FnMut(EvtxError) -> crate::err::Result<()>,
+    {
+        use crate::binxml::tokens::RawSubValue;
+
+        let estimated_template_buckets = self
+            .header
+            .template_offsets
+            .iter()
+            .filter(|&&offset| offset > 0)
+            .count();
+        let settings = Arc::clone(&self.settings);
+        let mut ir_template_cache =
+            IrTemplateCache::with_capacity(estimated_template_buckets, &self.arena);
+        let mut offset_from_chunk_start = EVTX_CHUNK_HEADER_SIZE as u64;
+        let mut exhausted = false;
+        // Reusable raw value descriptor buffer — allocated once, cleared per record.
+        let mut raw_values: Vec<RawSubValue> = Vec::with_capacity(32);
+
+        let effective_free_space_offset = u64::from(self.header.free_space_offset)
+            .min(self.data.len().try_into().unwrap_or(u64::MAX));
+
+        while !exhausted && offset_from_chunk_start < effective_free_space_offset {
+            let record_start = offset_from_chunk_start;
+            let record_start_usize = record_start as usize;
+
+            if record_start_usize >= self.data.len()
+                || self.data.len() - record_start_usize < 4
+            {
+                break;
+            }
+
+            let record_header =
+                match EvtxRecordHeader::from_bytes_at(self.data, record_start_usize) {
+                    Ok(h) => h,
+                    Err(DeserializationError::InvalidEvtxRecordHeaderMagic { magic }) => {
+                        if magic == [0, 0, 0, 0] {
+                            break;
+                        }
+                        exhausted = true;
+                        on_error(EvtxError::DeserializationError(
+                            DeserializationError::InvalidEvtxRecordHeaderMagic { magic },
+                        ))?;
+                        continue;
+                    }
+                    Err(DeserializationError::Truncated { .. }) => break,
+                    Err(err) => {
+                        exhausted = true;
+                        on_error(EvtxError::DeserializationError(err))?;
+                        continue;
+                    }
+                };
+
+            let binxml_data_size = match record_header.record_data_size() {
+                Ok(size) => size,
+                Err(err) => {
+                    exhausted = true;
+                    on_error(err)?;
+                    continue;
+                }
+            };
+
+            let binxml_start = record_start + EVTX_RECORD_HEADER_SIZE as u64;
+            let binxml_end = binxml_start.saturating_add(binxml_data_size as u64);
+            if binxml_end as usize > self.data.len() {
+                on_error(EvtxError::FailedToParseRecord {
+                    record_id: record_header.event_record_id,
+                    source: Box::new(EvtxError::FailedToCreateRecordModel(
+                        "record BinXML slice is out of bounds",
+                    )),
+                })?;
+                offset_from_chunk_start += u64::from(record_header.data_size);
+                continue;
+            }
+
+            let bytes = &self.data[binxml_start as usize..binxml_end as usize];
+
+            xml_buf.clear();
+
+            let ok = binxml_data_size >= 5
+                && try_compiled_xml_into(
+                    bytes,
+                    xml_buf,
+                    self,
+                    &mut ir_template_cache,
+                    &settings,
+                    &mut raw_values,
+                );
+
+            if !ok {
+                on_error(EvtxError::FailedToParseRecord {
+                    record_id: record_header.event_record_id,
+                    source: Box::new(EvtxError::FailedToCreateRecordModel(
+                        "compiled XML rendering failed",
+                    )),
+                })?;
+                offset_from_chunk_start += u64::from(record_header.data_size);
+                continue;
+            }
+
+            on_record(
+                record_header.event_record_id,
+                record_header.timestamp,
+                xml_buf,
+            );
+
+            offset_from_chunk_start += u64::from(record_header.data_size);
+            if self.header.last_event_record_id == record_header.event_record_id {
+                exhausted = true;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 /// An iterator over a chunk, yielding records.
@@ -350,6 +482,7 @@ impl<'a> Iterator for IterChunkRecords<'a> {
         }
 
         let bytes = &self.chunk.data[binxml_start as usize..binxml_end as usize];
+
         let tree_result =
             build_tree_from_binxml_bytes_direct(bytes, self.chunk, &mut self.ir_template_cache)
                 .map_err(|err| EvtxError::FailedToParseRecord {
@@ -377,6 +510,84 @@ impl<'a> Iterator for IterChunkRecords<'a> {
             binxml_size: binxml_data_size,
             settings: Arc::clone(&self.settings),
         }))
+    }
+}
+
+/// Render compiled XML for a record's BinXml bytes into an existing buffer.
+///
+/// Uses the raw value path: reads only byte-offset descriptors (no value parsing),
+/// then formats values directly from chunk data at render time.
+fn try_compiled_xml_into<'a>(
+    bytes: &'a [u8],
+    buf: &mut Vec<u8>,
+    chunk: &'a EvtxChunk<'a>,
+    ir_cache: &mut IrTemplateCache<'a>,
+    settings: &ParserSettings,
+    raw_values: &mut Vec<crate::binxml::tokens::RawSubValue>,
+) -> bool {
+    if bytes.len() < 5 || bytes[0] != 0x0f {
+        return false;
+    }
+
+    // Write the XML declaration
+    buf.extend_from_slice(b"<?xml version=\"1.0\" encoding=\"utf-8\"?>\n");
+
+    let indent = settings.should_indent();
+
+    if bytes[4] == 0x0c {
+        // TemplateInstance path: read raw value descriptors + render compiled template.
+        let binxml_abs_offset = {
+            let data_start = chunk.data.as_ptr() as usize;
+            let bytes_start = bytes.as_ptr() as usize;
+            bytes_start - data_start
+        };
+
+        let mut cursor = match ByteCursor::with_pos(chunk.data, binxml_abs_offset + 4 + 1) {
+            Ok(c) => c,
+            Err(_) => return false,
+        };
+
+        let template_def_offset = match crate::binxml::tokens::read_template_raw_values(
+            &mut cursor,
+            raw_values,
+        ) {
+            Ok(off) => off,
+            Err(_) => return false,
+        };
+
+        let compiled = match ir_cache.get_or_compile_xml_template(
+            chunk,
+            template_def_offset,
+            settings,
+        ) {
+            Some(c) => c,
+            None => return false,
+        };
+
+        let mut raw_ctx = compiled_xml::RawRenderContext {
+            chunk,
+            cache: ir_cache,
+            settings,
+        };
+        compiled_xml::render_compiled_xml_raw(
+            &compiled,
+            raw_values,
+            chunk.data,
+            buf,
+            &mut raw_ctx,
+            indent,
+            0,
+        )
+    } else {
+        // Inline BinXml path: no TemplateInstance, compile tokens directly.
+        // Skip FragmentHeader (4 bytes: token + major + minor + flags).
+        compiled_xml::render_record_inline_tokens(
+            &bytes[4..],
+            buf,
+            chunk,
+            ir_cache,
+            settings,
+        )
     }
 }
 

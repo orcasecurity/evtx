@@ -319,6 +319,82 @@ pub(crate) fn read_substitution_descriptor_cursor(
     })
 }
 
+/// Lightweight substitution descriptor — just byte location metadata, no parsing.
+///
+/// Instead of deserializing each substitution value into a typed `BinXmlValue` enum,
+/// this records only the byte offset, size, and raw type byte. The actual value bytes
+/// are read directly from chunk data at render time.
+#[derive(Debug, Clone)]
+pub(crate) struct RawSubValue {
+    /// Byte offset within chunk.data where this value starts.
+    pub offset: usize,
+    /// Byte size of the value data.
+    pub size: u16,
+    /// Raw BinXml value type byte (e.g. 0x01=String, 0x11=FileTime).
+    pub value_type: u8,
+}
+
+/// Read a `TemplateInstance` header and build raw value descriptors without parsing values.
+///
+/// This is the zero-parse equivalent of `read_template_values_cursor`. Instead of
+/// constructing typed `BinXmlValue` variants, it records byte offsets into chunk data.
+/// The caller provides a reusable `Vec<RawSubValue>` that is cleared and filled.
+///
+/// Returns the `template_def_offset` on success.
+pub(crate) fn read_template_raw_values(
+    cursor: &mut ByteCursor<'_>,
+    raw_values: &mut Vec<RawSubValue>,
+) -> Result<u32> {
+    let _ = cursor.u8()?; // unknown byte
+    let _template_id = cursor.u32()?;
+    let template_def_offset = cursor.u32()?;
+
+    // Need to skip over inline template definition if present.
+    if (cursor.position() as u32) == template_def_offset {
+        let header = read_template_definition_header_cursor(cursor)?;
+        cursor.set_pos_u64(
+            cursor.position() + u64::from(header.data_size),
+            "Skip cached template",
+        )?;
+    }
+
+    let n = cursor.u32()? as usize;
+
+    // Read descriptor table: N × (u16 size, u8 type, u8 padding).
+    // We store them in a temporary stack-local structure to compute offsets afterward.
+    raw_values.clear();
+    raw_values.reserve(n);
+
+    struct Desc {
+        size: u16,
+        value_type: u8,
+    }
+    let mut descs = Vec::with_capacity(n);
+    for _ in 0..n {
+        let size = cursor.u16()?;
+        let value_type = cursor.u8()?;
+        let _ = cursor.u8()?; // padding
+        descs.push(Desc { size, value_type });
+    }
+
+    // The value data immediately follows the descriptor table.
+    // Compute byte offsets by accumulating sizes from cursor position.
+    let mut offset = cursor.pos();
+    for desc in &descs {
+        raw_values.push(RawSubValue {
+            offset,
+            size: desc.size,
+            value_type: desc.value_type,
+        });
+        offset += desc.size as usize;
+    }
+
+    // Advance cursor past all value data bytes.
+    cursor.set_pos(offset, "Skip raw values")?;
+
+    Ok(template_def_offset)
+}
+
 pub(crate) fn read_open_start_element_cursor(
     cursor: &mut ByteCursor<'_>,
     has_attributes: bool,

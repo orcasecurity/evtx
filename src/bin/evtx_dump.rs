@@ -225,9 +225,35 @@ impl EvtxDump {
 
         match self.output_format {
             EvtxOutputFormat::XML => {
-                for record in parser.records() {
-                    self.dump_record(record)?
-                }
+                let show_record_number = self.show_record_number;
+                let ranges = self.ranges.clone();
+                let stop_after_error = self.stop_after_error;
+                let output = &mut self.output;
+
+                parser.for_each_xml_record(
+                    |event_record_id, _timestamp, xml_bytes| {
+                        let range_filter = if let Some(ref ranges) = ranges {
+                            ranges.contains(&(event_record_id as usize))
+                        } else {
+                            true
+                        };
+
+                        if range_filter {
+                            if show_record_number {
+                                let _ = writeln!(output, "Record {}", event_record_id);
+                            }
+                            let _ = output.write_all(xml_bytes);
+                            let _ = output.write_all(b"\n");
+                        }
+                    },
+                    |err| {
+                        eprintln!("{:?}", format_err!(err));
+                        if stop_after_error {
+                            std::process::exit(1);
+                        }
+                        Ok(())
+                    },
+                )?;
             }
             EvtxOutputFormat::JSON => {
                 for record in parser.records_json() {

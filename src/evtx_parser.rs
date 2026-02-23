@@ -493,8 +493,7 @@ impl<T: ReadSeek> EvtxParser<T> {
                                 },
                                 Ok(mut chunk_records) => {
                                     let results = {
-                                        let records = chunk_records.iter();
-                                        records.map(f.clone()).collect()
+                                        chunk_records.iter().map(f.clone()).collect()
                                     };
                                     let arena = chunk_records.into_arena();
                                     ChunkBatch { results, arena }
@@ -520,7 +519,6 @@ impl<T: ReadSeek> EvtxParser<T> {
     /// Return an iterator over all the records.
     /// Records will be XML-formatted.
     pub fn records(&mut self) -> impl Iterator<Item = Result<SerializedEvtxRecord<String>>> + '_ {
-        // '_ is required in the signature because the iterator is bound to &self.
         self.serialized_records(|record| record.and_then(|record| record.into_xml()))
     }
 
@@ -538,6 +536,54 @@ impl<T: ReadSeek> EvtxParser<T> {
         &mut self,
     ) -> impl Iterator<Item = Result<SerializedEvtxRecord<serde_json::Value>>> + '_ {
         self.serialized_records(|record| record.and_then(|record| record.into_json_value()))
+    }
+
+    /// Process all XML records using a callback, avoiding per-record String allocations.
+    ///
+    /// This is faster than `records()` for callers that write XML output to a sink
+    /// because it reuses a single buffer across all records instead of allocating
+    /// a new `String` for each one.
+    ///
+    /// The `on_record` callback receives `(event_record_id, timestamp, xml_bytes)`.
+    /// The `on_error` callback receives parse errors and returns `Ok(())` to continue
+    /// or `Err(...)` to stop iteration.
+    pub fn for_each_xml_record<F, E>(
+        &mut self,
+        mut on_record: F,
+        mut on_error: E,
+    ) -> Result<()>
+    where
+        F: FnMut(u64, jiff::Timestamp, &[u8]),
+        E: FnMut(EvtxError) -> Result<()>,
+    {
+        let chunk_settings = Arc::clone(&self.config);
+        let mut xml_buf = Vec::with_capacity(4096);
+        let mut arena = Bump::with_capacity(EVTX_CHUNK_SIZE);
+
+        for chunk_result in self.chunks() {
+            let mut chunk_data = match chunk_result {
+                Ok(c) => c,
+                Err(err) => {
+                    on_error(err)?;
+                    continue;
+                }
+            };
+            match chunk_data.parse_with_arena(chunk_settings.clone(), arena) {
+                Ok(mut chunk) => {
+                    chunk.for_each_xml_record(&mut xml_buf, &mut on_record, &mut on_error)?;
+                    arena = chunk.into_arena();
+                }
+                Err(err) => {
+                    arena = Bump::with_capacity(EVTX_CHUNK_SIZE);
+                    on_error(EvtxError::FailedToParseChunk {
+                        chunk_id: 0,
+                        source: Box::new(err),
+                    })?;
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 

@@ -196,3 +196,79 @@ fn test_sample_with_zero_data_size_event() {
     }
     assert_eq!(count, 336, "Single threaded iteration failed");
 }
+
+#[test]
+fn test_compiled_xml_matches_ir_xml_for_all_samples() {
+    ensure_env_logger_initialized();
+    let samples = [
+        "security.evtx",
+        "system.evtx",
+        "new-user-security.evtx",
+        "Application.evtx",
+        "sysmon.evtx",
+        "Security_short_selected.evtx",
+        "Security_with_size_t.evtx",
+        "E_Windows_system32_winevt_logs_Microsoft-Windows-CAPI2%4Operational.evtx",
+        "E_Windows_system32_winevt_logs_Microsoft-Windows-Shell-Core%4Operational.evtx",
+        "Archive-ForwardedEvents-test.evtx",
+    ];
+
+    for sample in &samples {
+        let path = samples_dir().join(sample);
+        if !path.exists() {
+            continue;
+        }
+
+        // IR path: records() renders via IR tree
+        let mut parser_ir = EvtxParser::from_path(&path).unwrap()
+            .with_configuration(ParserSettings::new().indent(true));
+        let ir_records: Vec<_> = parser_ir.records().collect();
+
+        // Compiled raw XML path: for_each_xml_record uses compiled templates
+        let mut parser_compiled = EvtxParser::from_path(&path).unwrap()
+            .with_configuration(ParserSettings::new().indent(true));
+        let mut compiled_records: Vec<(u64, String)> = Vec::new();
+        let mut compiled_errors: Vec<String> = Vec::new();
+        parser_compiled
+            .for_each_xml_record(
+                |record_id, _ts, xml_bytes| {
+                    compiled_records.push((
+                        record_id,
+                        String::from_utf8_lossy(xml_bytes).into_owned(),
+                    ));
+                },
+                |err| {
+                    compiled_errors.push(format!("{:?}", err));
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        // Count IR successes and errors for comparison
+        let ir_ok: Vec<_> = ir_records.iter().filter(|r| r.is_ok()).collect();
+
+        if ir_ok.len() != compiled_records.len() {
+            eprintln!("{}: errors: {:?}", sample, &compiled_errors[..compiled_errors.len().min(5)]);
+        }
+        assert_eq!(
+            ir_ok.len(),
+            compiled_records.len(),
+            "{}: record count mismatch (IR ok={}, compiled={}, errors={})",
+            sample,
+            ir_ok.len(),
+            compiled_records.len(),
+            compiled_errors.len()
+        );
+
+        for (i, (ir, (compiled_id, compiled_xml))) in
+            ir_ok.iter().zip(compiled_records.iter()).enumerate()
+        {
+            let ir_rec = ir.as_ref().unwrap();
+            assert_eq!(
+                ir_rec.data, *compiled_xml,
+                "{}: record {} (id={}) XML mismatch",
+                sample, i, compiled_id
+            );
+        }
+    }
+}

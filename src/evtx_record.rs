@@ -130,11 +130,11 @@ impl<'a> EvtxRecord<'a> {
 
     /// Consumes the record and parse it, producing an XML serialized record.
     pub fn into_xml(self) -> Result<SerializedEvtxRecord<String>> {
-        let capacity_hint = self.binxml_size as usize * 2;
-        let buf = Vec::with_capacity(capacity_hint);
-
         let event_record_id = self.event_record_id;
         let timestamp = self.timestamp;
+
+        let capacity_hint = self.binxml_size as usize * 2;
+        let buf = Vec::with_capacity(capacity_hint);
 
         let mut writer = buf;
         render_xml_record(&self.tree, &self.settings, &mut writer).map_err(|e| {

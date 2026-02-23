@@ -70,6 +70,7 @@ use crate::EvtxChunk;
 use crate::binxml::array_expand::{
     expand_array_substitutions_in_element, node_needs_array_expansion,
 };
+use crate::binxml::compiled_xml::{self, CompiledXmlTemplate};
 use crate::binxml::name::{BinXmlNameEncoding, BinXmlNameRef};
 use crate::binxml::tokens::{
     BinXMLAttribute, BinXMLOpenStartElement, BinXMLProcessingInstructionTarget,
@@ -86,6 +87,7 @@ use crate::model::ir::{
     is_optional_empty_template_value,
 };
 use crate::utils::{ByteCursor, Utf16LeSlice};
+use crate::ParserSettings;
 use ahash::AHashMap;
 use bumpalo::Bump;
 use encoding::EncodingRef;
@@ -161,9 +163,10 @@ const TEMPLATE_DEFINITION_HEADER_SIZE: usize = 24;
 ///
 /// Templates are stored as IR trees containing placeholders; instantiation
 /// clones the tree and resolves all placeholders using substitution values.
-#[derive(Debug)]
 pub(crate) struct IrTemplateCache<'a> {
     templates: AHashMap<[u8; 16], Rc<IrTree<'a>>>,
+    /// Compiled XML template cache: `None` means "compilation failed, always use IR path".
+    compiled_xml: AHashMap<[u8; 16], Option<Rc<CompiledXmlTemplate>>>,
     arena: &'a Bump,
 }
 
@@ -176,8 +179,27 @@ impl<'a> IrTemplateCache<'a> {
     pub fn with_capacity(capacity: usize, arena: &'a Bump) -> Self {
         IrTemplateCache {
             templates: AHashMap::with_capacity(capacity),
+            compiled_xml: AHashMap::with_capacity(capacity),
             arena,
         }
+    }
+
+    /// Look up or compile a compiled XML template for the given template definition.
+    ///
+    /// Returns `Some(Rc<CompiledXmlTemplate>)` if compilation succeeded, `None` if
+    /// the template cannot be compiled (bail condition cached as `None`).
+    pub(crate) fn get_or_compile_xml_template(
+        &mut self,
+        chunk: &EvtxChunk<'_>,
+        template_def_offset: u32,
+        settings: &ParserSettings,
+    ) -> Option<Rc<CompiledXmlTemplate>> {
+        let header = read_template_definition_header_at(chunk.data, template_def_offset).ok()?;
+        let entry = self
+            .compiled_xml
+            .entry(header.guid)
+            .or_insert_with(|| compiled_xml::compile_xml_template(chunk, template_def_offset, settings).map(Rc::new));
+        entry.clone()
     }
 
     /// Instantiate a template instance and return the root `ElementId` of the instantiated tree.
