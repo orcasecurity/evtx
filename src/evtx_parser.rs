@@ -1,6 +1,6 @@
 use crate::err::{ChunkError, EvtxError, InputError, Result};
 
-use crate::evtx_chunk::EvtxChunkData;
+use crate::evtx_chunk::{EVTX_CHUNK_HEADER_SIZE, EvtxChunkData, EvtxChunkHeader};
 use crate::evtx_file_header::EvtxFileHeader;
 use crate::evtx_record::SerializedEvtxRecord;
 use bumpalo::Bump;
@@ -329,6 +329,83 @@ impl<T: ReadSeek> EvtxParser<T> {
         self
     }
 
+    /// Returns the number of chunks in the file, calculated from the file size.
+    pub fn chunk_count(&self) -> u64 {
+        self.calculated_chunk_count
+    }
+
+    /// Read only the 512-byte chunk header at the given chunk number,
+    /// without reading the full 64KB chunk data.
+    fn read_chunk_header(&mut self, chunk_number: u64) -> Result<Option<EvtxChunkHeader>> {
+        let chunk_offset =
+            EVTX_FILE_HEADER_SIZE as u64 + chunk_number * EVTX_CHUNK_SIZE as u64;
+
+        self.data
+            .seek(SeekFrom::Start(chunk_offset))
+            .map_err(|e| EvtxError::FailedToParseChunk {
+                chunk_id: chunk_number,
+                source: Box::new(ChunkError::FailedToSeekToChunk(e)),
+            })?;
+
+        let mut header_data = [0u8; EVTX_CHUNK_HEADER_SIZE];
+        let amount_read = self
+            .data
+            .read(&mut header_data)
+            .map_err(|_| EvtxError::incomplete_chunk(chunk_number))?;
+
+        if amount_read < EVTX_CHUNK_HEADER_SIZE {
+            return Err(EvtxError::incomplete_chunk(chunk_number));
+        }
+
+        if header_data.iter().all(|&x| x == 0) {
+            return Ok(None);
+        }
+
+        EvtxChunkHeader::from_bytes(&header_data)
+            .map(Some)
+            .map_err(|e| EvtxError::FailedToParseChunk {
+                chunk_id: chunk_number,
+                source: Box::new(ChunkError::FailedToParseChunkHeader(e)),
+            })
+    }
+
+    /// Scans chunk headers backward from the end of the file to determine the
+    /// starting chunk and record skip count needed to yield exactly `num_records`
+    /// records from the tail of the file.
+    ///
+    /// Returns `(start_chunk, skip_count)` where `start_chunk` is the chunk
+    /// number to begin iterating from and `skip_count` is how many records to
+    /// skip from that chunk to yield exactly `num_records`.
+    fn find_tail_start_chunk(&mut self, num_records: usize) -> (u64, usize) {
+        if self.calculated_chunk_count == 0 {
+            return (0, 0);
+        }
+
+        let mut accumulated: usize = 0;
+        let mut earliest_chunk: u64 = self.calculated_chunk_count.saturating_sub(1);
+
+        for chunk_num in (0..self.calculated_chunk_count).rev() {
+            match self.read_chunk_header(chunk_num) {
+                Ok(Some(header)) => {
+                    let records_in_chunk =
+                        (header.last_event_record_id - header.first_event_record_id + 1) as usize;
+                    accumulated += records_in_chunk;
+                    earliest_chunk = chunk_num;
+
+                    if accumulated >= num_records {
+                        let skip = accumulated - num_records;
+                        return (earliest_chunk, skip);
+                    }
+                }
+                // Skip empty or unreadable chunks
+                Ok(None) | Err(_) => continue,
+            }
+        }
+
+        // File has fewer than num_records records total
+        (earliest_chunk, 0)
+    }
+
     /// Allocate a new chunk from the given data, at the offset expected by `chunk_number`.
     /// If the read chunk contains valid data, an `Ok(Some(EvtxChunkData))` will be returned.
     /// If the read chunk contains invalid data (bad magic, bad checksum when `validate_checksum` is set to true),
@@ -414,9 +491,14 @@ impl<T: ReadSeek> EvtxParser<T> {
     /// Each chunk supports iterating over it's records in their un-serialized state
     /// (before they are converted to XML or JSON).
     pub fn chunks(&mut self) -> IterChunks<'_, T> {
+        self.chunks_from(0)
+    }
+
+    /// Return an iterator over chunks starting from the given chunk number.
+    pub fn chunks_from(&mut self, start_chunk: u64) -> IterChunks<'_, T> {
         IterChunks {
             parser: self,
-            current_chunk_number: 0,
+            current_chunk_number: start_chunk,
         }
     }
 
@@ -424,15 +506,29 @@ impl<T: ReadSeek> EvtxParser<T> {
     /// Each chunk supports iterating over it's records in their un-serialized state
     /// (before they are converted to XML or JSON).
     pub fn into_chunks(self) -> IntoIterChunks<T> {
+        self.into_chunks_from(0)
+    }
+
+    /// Consumes the parser, returning an iterator over chunks starting from
+    /// the given chunk number.
+    pub fn into_chunks_from(self, start_chunk: u64) -> IntoIterChunks<T> {
         IntoIterChunks {
             parser: self,
-            current_chunk_number: 0,
+            current_chunk_number: start_chunk,
         }
     }
     /// Return an iterator over all the records.
     /// Records will be mapped `f`, which must produce owned data from the records.
     pub fn serialized_records<'a, U: Send>(
         &'a mut self,
+        f: impl FnMut(Result<EvtxRecord<'_>>) -> Result<U> + Send + Sync + Clone + 'a,
+    ) -> impl Iterator<Item = Result<U>> + 'a {
+        self.serialized_records_from_chunk(0, f)
+    }
+
+    fn serialized_records_from_chunk<'a, U: Send>(
+        &'a mut self,
+        start_chunk: u64,
         f: impl FnMut(Result<EvtxRecord<'_>>) -> Result<U> + Send + Sync + Clone + 'a,
     ) -> impl Iterator<Item = Result<U>> + 'a {
         struct ChunkBatch<U> {
@@ -445,7 +541,7 @@ impl<T: ReadSeek> EvtxParser<T> {
         let chunk_settings = Arc::clone(&self.config);
 
         // `self` is mutably borrowed from here on.
-        let mut chunks = self.chunks();
+        let mut chunks = self.chunks_from(start_chunk);
         let mut arena_pool: Vec<Bump> = (0..num_threads)
             .map(|_| Bump::with_capacity(EVTX_CHUNK_SIZE))
             .collect();
@@ -538,6 +634,49 @@ impl<T: ReadSeek> EvtxParser<T> {
         &mut self,
     ) -> impl Iterator<Item = Result<SerializedEvtxRecord<serde_json::Value>>> + '_ {
         self.serialized_records(|record| record.and_then(|record| record.into_json_value()))
+    }
+
+    /// Return an iterator over the last `num_records` records, XML-formatted.
+    /// Only reads chunk headers to find the starting position, then parses
+    /// just the necessary chunks.
+    pub fn records_tail(
+        &mut self,
+        num_records: usize,
+    ) -> impl Iterator<Item = Result<SerializedEvtxRecord<String>>> + '_ {
+        let (start_chunk, skip) = self.find_tail_start_chunk(num_records);
+        self.serialized_records_from_chunk(start_chunk, |record| {
+            record.and_then(|record| record.into_xml())
+        })
+        .skip(skip)
+    }
+
+    /// Return an iterator over the last `num_records` records, JSON-formatted.
+    /// Only reads chunk headers to find the starting position, then parses
+    /// just the necessary chunks.
+    pub fn records_json_tail(
+        &mut self,
+        num_records: usize,
+    ) -> impl Iterator<Item = Result<SerializedEvtxRecord<String>>> + '_ {
+        let (start_chunk, skip) = self.find_tail_start_chunk(num_records);
+        self.serialized_records_from_chunk(start_chunk, |record| {
+            record.and_then(|record| record.into_json())
+        })
+        .skip(skip)
+    }
+
+    /// Return an iterator over the last `num_records` records as
+    /// `serde_json::Value`.
+    /// Only reads chunk headers to find the starting position, then parses
+    /// just the necessary chunks.
+    pub fn records_json_value_tail(
+        &mut self,
+        num_records: usize,
+    ) -> impl Iterator<Item = Result<SerializedEvtxRecord<serde_json::Value>>> + '_ {
+        let (start_chunk, skip) = self.find_tail_start_chunk(num_records);
+        self.serialized_records_from_chunk(start_chunk, |record| {
+            record.and_then(|record| record.into_json_value())
+        })
+        .skip(skip)
     }
 }
 
@@ -759,6 +898,111 @@ mod tests {
             assert!(record.data.is_object());
             assert!(record.data.as_object().unwrap().contains_key("Event"));
         }
+    }
+
+    #[test]
+    fn test_records_tail_returns_last_n_records() {
+        ensure_env_logger_initialized();
+        let evtx_file = include_bytes!("../samples/security.evtx");
+
+        // Get all records to compare against
+        let mut parser = EvtxParser::from_buffer(evtx_file.to_vec()).unwrap();
+        let all_records: Vec<_> = parser
+            .records()
+            .filter_map(|r| r.ok())
+            .collect();
+        let total = all_records.len();
+        assert!(total > 100, "Need enough records for the test");
+
+        // Get last 100 via tail
+        let mut parser = EvtxParser::from_buffer(evtx_file.to_vec()).unwrap();
+        let tail_records: Vec<_> = parser
+            .records_tail(100)
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(tail_records.len(), 100);
+
+        // Verify they match the last 100 from the full parse
+        let expected = &all_records[total - 100..];
+        for (tail_rec, expected_rec) in tail_records.iter().zip(expected.iter()) {
+            assert_eq!(tail_rec.event_record_id, expected_rec.event_record_id);
+            assert_eq!(tail_rec.data, expected_rec.data);
+        }
+    }
+
+    #[test]
+    fn test_records_tail_more_than_total_returns_all() {
+        ensure_env_logger_initialized();
+        let evtx_file = include_bytes!("../samples/security.evtx");
+
+        let mut parser = EvtxParser::from_buffer(evtx_file.to_vec()).unwrap();
+        let all_count = parser.records().filter_map(|r| r.ok()).count();
+
+        let mut parser = EvtxParser::from_buffer(evtx_file.to_vec()).unwrap();
+        let tail_count = parser.records_tail(999999).filter_map(|r| r.ok()).count();
+
+        assert_eq!(tail_count, all_count);
+    }
+
+    #[test]
+    fn test_records_json_tail() {
+        ensure_env_logger_initialized();
+        let evtx_file = include_bytes!("../samples/security.evtx");
+
+        let mut parser = EvtxParser::from_buffer(evtx_file.to_vec()).unwrap();
+        let tail_records: Vec<_> = parser
+            .records_json_tail(10)
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(tail_records.len(), 10);
+        // Verify JSON is valid
+        for rec in &tail_records {
+            assert!(serde_json::from_str::<serde_json::Value>(&rec.data).is_ok());
+        }
+    }
+
+    #[test]
+    fn test_records_tail_single_chunk_file() {
+        ensure_env_logger_initialized();
+        let evtx_file = include_bytes!("../samples/new-user-security.evtx");
+
+        let mut parser = EvtxParser::from_buffer(evtx_file.to_vec()).unwrap();
+        let tail_records: Vec<_> = parser
+            .records_tail(2)
+            .filter_map(|r| r.ok())
+            .collect();
+
+        assert_eq!(tail_records.len(), 2);
+
+        // Verify these are the last 2 records
+        let mut parser = EvtxParser::from_buffer(evtx_file.to_vec()).unwrap();
+        let all_records: Vec<_> = parser
+            .records()
+            .filter_map(|r| r.ok())
+            .collect();
+        let total = all_records.len();
+
+        assert_eq!(
+            tail_records.last().unwrap().event_record_id,
+            all_records.last().unwrap().event_record_id
+        );
+        assert_eq!(
+            tail_records.first().unwrap().event_record_id,
+            all_records[total - 2].event_record_id
+        );
+    }
+
+    #[test]
+    fn test_chunk_count_accessor() {
+        ensure_env_logger_initialized();
+        let evtx_file = include_bytes!("../samples/security.evtx");
+        let parser = EvtxParser::from_buffer(evtx_file.to_vec()).unwrap();
+
+        // The header stores chunk_count as u16 (26), but the calculated
+        // count from file size may differ for files with trailing data.
+        assert!(parser.chunk_count() > 0);
     }
 
     #[test]
