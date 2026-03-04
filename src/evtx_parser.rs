@@ -376,7 +376,7 @@ impl<T: ReadSeek> EvtxParser<T> {
     /// Returns `(start_chunk, skip_count)` where `start_chunk` is the chunk
     /// number to begin iterating from and `skip_count` is how many records to
     /// skip from that chunk to yield exactly `num_records`.
-    fn find_tail_start_chunk(&mut self, num_records: usize) -> (u64, usize) {
+    pub fn find_tail_start_chunk(&mut self, num_records: usize) -> (u64, usize) {
         if self.calculated_chunk_count == 0 {
             return (0, 0);
         }
